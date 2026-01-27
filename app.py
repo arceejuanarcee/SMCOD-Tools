@@ -3,7 +3,7 @@ from pathlib import Path
 import streamlit as st
 import ms_graph
 
-st.set_page_config(page_title="PhilSA Tools Portal", layout="wide")
+st.set_page_config(page_title="SMCOD Tools Portal", layout="wide")
 
 ROOT = Path(__file__).parent
 LOGO_PATH = ROOT / "graphics" / "PhilSA_v4-01.png"
@@ -30,7 +30,7 @@ if LOGO_PATH.exists():
     st.image(str(LOGO_PATH), width=160)
     st.markdown("</div>", unsafe_allow_html=True)
 
-st.markdown("<div class='portal-title'>PhilSA Tools Portal</div>", unsafe_allow_html=True)
+st.markdown("<div class='portal-title'>SMCOD Tools Portal</div>", unsafe_allow_html=True)
 st.markdown("<div class='portal-sub'>Sign in with your PhilSA email to access internal tools.</div>", unsafe_allow_html=True)
 
 # ✅ ONLY place where login UI is shown:
