@@ -1,122 +1,64 @@
 # ms_graph.py
 import os
 import time
-import secrets
 import streamlit as st
 import msal
 
-DEFAULT_SCOPES_READONLY = ["User.Read", "Sites.Read.All"]
-DEFAULT_SCOPES_WRITE = ["User.Read", "Sites.ReadWrite.All"]
+DEFAULT_SCOPES = ["User.Read"]
 
-def _cfg() -> dict:
-    s = st.secrets.get("ms_graph", {})
-    tenant_id = s.get("tenant_id") or os.getenv("MS_TENANT_ID", "")
-    client_id = s.get("client_id") or os.getenv("MS_CLIENT_ID", "")
-    client_secret = s.get("client_secret") or os.getenv("MS_CLIENT_SECRET", "")
-    redirect_uri = s.get("redirect_uri") or os.getenv("MS_REDIRECT_URI", "")
-    authority = s.get("authority") or (f"https://login.microsoftonline.com/{tenant_id}" if tenant_id else "")
+def _cfg():
+    s = st.secrets["ms_graph"]
     return {
-        "tenant_id": tenant_id,
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "redirect_uri": redirect_uri,
-        "authority": authority,
+        "client_id": s["client_id"],
+        "client_secret": s["client_secret"],
+        "tenant_id": s["tenant_id"],
+        "authority": f"https://login.microsoftonline.com/{s['tenant_id']}",
+        "redirect_uri": s["redirect_uri"],
     }
 
-def _require_cfg() -> dict:
-    cfg = _cfg()
-    missing = [k for k in ["tenant_id", "client_id", "client_secret", "redirect_uri", "authority"] if not cfg.get(k)]
-    if missing:
-        st.error("Missing MS Graph config in secrets: " + ", ".join(missing))
-        st.stop()
-    return cfg
-
-def _msal_app() -> msal.ConfidentialClientApplication:
-    cfg = _require_cfg()
+def _app():
+    c = _cfg()
     return msal.ConfidentialClientApplication(
-        client_id=cfg["client_id"],
-        client_credential=cfg["client_secret"],
-        authority=cfg["authority"],
+        c["client_id"],
+        authority=c["authority"],
+        client_credential=c["client_secret"],
     )
 
-def logout():
-    for k in ["ms_token", "ms_scopes"]:
-        st.session_state.pop(k, None)
-    try:
-        st.query_params.clear()
-    except Exception:
-        pass
-    st.rerun()
-
-def login_ui(scopes=None):
-    """
-    Call this ONLY on app.py login view.
-    """
-    app = _msal_app()
-    cfg = _require_cfg()
-
-    if scopes is None:
-        scopes = DEFAULT_SCOPES_READONLY
-    st.session_state["ms_scopes"] = scopes
-
-    # already logged in
-    if st.session_state.get("ms_token"):
+def login_ui():
+    if st.session_state.get("authenticated"):
         return
 
-    qp = st.query_params
+    app = _app()
+    cfg = _cfg()
 
-    # ----- CALLBACK -----
-    if qp.get("code"):
-        code = qp.get("code")
-        try:
-            result = app.acquire_token_by_authorization_code(
-                code=code,
-                scopes=scopes,
-                redirect_uri=cfg["redirect_uri"],
-            )
-        except Exception as e:
-            st.error(f"Login failed: {e}")
-            return
+    # CALLBACK
+    if "code" in st.query_params:
+        result = app.acquire_token_by_authorization_code(
+            st.query_params["code"],
+            scopes=DEFAULT_SCOPES,
+            redirect_uri=cfg["redirect_uri"],
+        )
 
         if "access_token" in result:
-            st.session_state["ms_token"] = result
-            try:
-                st.query_params.clear()
-            except Exception:
-                pass
-
-            # ✅ Always land on portal after login
-            try:
-                st.switch_page("app.py")
-            except Exception:
-                st.rerun()
+            st.session_state["authenticated"] = True
+            st.session_state["token"] = result
+            st.query_params.clear()
+            st.switch_page("app.py")
         else:
-            st.error(f"Login failed: {result}")
-            return
+            st.error("Login failed")
+        st.stop()
 
-    # ----- SHOW SIGN IN -----
-    state = secrets.token_urlsafe(16)
+    # LOGIN BUTTON
     auth_url = app.get_authorization_request_url(
-        scopes=scopes,
+        scopes=DEFAULT_SCOPES,
         redirect_uri=cfg["redirect_uri"],
-        state=state,
         prompt="select_account",
     )
     st.link_button("Sign In", auth_url)
 
-def get_access_token():
-    token = st.session_state.get("ms_token")
-    if not token:
-        return None
+def is_authenticated():
+    return st.session_state.get("authenticated", False)
 
-    expires_at = token.get("expires_at")
-    if not expires_at:
-        expires_in = token.get("expires_in", 3600)
-        token["expires_at"] = int(time.time()) + int(expires_in)
-        expires_at = token["expires_at"]
-
-    if int(expires_at) - int(time.time()) < 120:
-        st.session_state.pop("ms_token", None)
-        return None
-
-    return token.get("access_token")
+def logout():
+    st.session_state.clear()
+    st.switch_page("app.py")
