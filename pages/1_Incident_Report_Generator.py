@@ -4,7 +4,8 @@ import ms_graph
 import runpy
 from pathlib import Path
 
-# If not logged in, always go back to portal
+# Never do login here.
+# If not logged in, always go back to portal.
 if not ms_graph.get_access_token():
     st.switch_page("app.py")
     st.stop()

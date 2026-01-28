@@ -1,7 +1,6 @@
 # ms_graph.py
 import os
 import time
-import secrets
 import streamlit as st
 import msal
 
@@ -16,7 +15,6 @@ def _cfg() -> dict:
     client_secret = s.get("client_secret") or os.getenv("MS_CLIENT_SECRET", "")
     redirect_uri = s.get("redirect_uri") or os.getenv("MS_REDIRECT_URI", "")
     authority = s.get("authority") or (f"https://login.microsoftonline.com/{tenant_id}" if tenant_id else "")
-
     return {
         "tenant_id": tenant_id,
         "client_id": client_id,
@@ -44,6 +42,16 @@ def _msal_app() -> msal.ConfidentialClientApplication:
     )
 
 
+def _qp_get(name: str):
+    """Streamlit query params can be str or list; normalize to str or None."""
+    v = st.query_params.get(name)
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        return v[0] if v else None
+    return v
+
+
 def logout():
     for k in ["ms_token", "ms_scopes"]:
         st.session_state.pop(k, None)
@@ -51,13 +59,13 @@ def logout():
         st.query_params.clear()
     except Exception:
         pass
-    st.switch_page("app.py")
+    st.rerun()
 
 
 def login_ui(scopes=None):
     """
-    Render sign-in button and handle callback.
-    Call this ONLY in app.py (login page).
+    Call ONLY on app.py when NOT logged in.
+    This uses acquire_token_by_authorization_code (no saved flow/state dependency).
     """
     app = _msal_app()
     cfg = _require_cfg()
@@ -70,13 +78,9 @@ def login_ui(scopes=None):
     if st.session_state.get("ms_token"):
         return
 
-    qp = st.query_params
-
-    # --------------------
-    # CALLBACK (no state dependency)
-    # --------------------
-    if qp.get("code"):
-        code = qp.get("code")
+    # Callback: code from Azure
+    code = _qp_get("code")
+    if code:
         try:
             result = app.acquire_token_by_authorization_code(
                 code=code,
@@ -88,32 +92,25 @@ def login_ui(scopes=None):
             return
 
         if "access_token" in result:
-            # store token
             st.session_state["ms_token"] = result
-            # clear query params
             try:
                 st.query_params.clear()
             except Exception:
                 pass
-            # always go to portal dashboard
-            st.switch_page("app.py")
+
+            # Important: just rerun; app.py will now show tiles
+            st.rerun()
         else:
-            st.error("Login failed. Check Azure app registration + scopes.")
+            st.error("Login failed. Check Azure app registration + redirect URI + scopes.")
             st.write(result)
         return
 
-    # --------------------
-    # SIGN IN LINK
-    # --------------------
-    # We still generate a state for security, but we DO NOT require it in callback.
-    _ = secrets.token_urlsafe(16)
-
+    # Show Sign In button
     auth_url = app.get_authorization_request_url(
         scopes=scopes,
         redirect_uri=cfg["redirect_uri"],
         prompt="select_account",
     )
-
     st.link_button("Sign In", auth_url)
 
 
@@ -122,14 +119,14 @@ def get_access_token():
     if not token:
         return None
 
-    # compute expires_at if missing
+    # Ensure we have an expires_at
     expires_at = token.get("expires_at")
     if not expires_at:
         expires_in = int(token.get("expires_in", 3600))
         token["expires_at"] = int(time.time()) + expires_in
         expires_at = token["expires_at"]
 
-    # expire soon => force re-login
+    # If expiring soon, force re-login
     if int(expires_at) - int(time.time()) < 120:
         st.session_state.pop("ms_token", None)
         return None
