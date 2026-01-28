@@ -1,11 +1,12 @@
 # ms_graph.py
 import os
 import time
+import json
 import streamlit as st
 import msal
 
 DEFAULT_SCOPES_READONLY = ["User.Read", "Sites.Read.All"]
-DEFAULT_SCOPES_WRITE = ["User.Read", "Sites.ReadWrite.All"]
+DEFAULT_SCOPES_WRITE = ["User.Read", "Sites.ReadWrite.All"]  # requires admin consent in most tenants
 
 
 def _cfg() -> dict:
@@ -33,6 +34,34 @@ def _require_cfg() -> dict:
     return cfg
 
 
+def _get_cache() -> msal.SerializableTokenCache:
+    if "msal_cache" not in st.session_state:
+        st.session_state["msal_cache"] = ""
+    cache = msal.SerializableTokenCache()
+    if st.session_state["msal_cache"]:
+        try:
+            cache.deserialize(st.session_state["msal_cache"])
+        except Exception:
+            # corrupted cache, reset
+            st.session_state["msal_cache"] = ""
+    return cache
+
+
+def _save_cache(cache: msal.SerializableTokenCache):
+    if cache.has_state_changed:
+        st.session_state["msal_cache"] = cache.serialize()
+
+
+def _msal_app(cache: msal.SerializableTokenCache) -> msal.ConfidentialClientApplication:
+    cfg = _require_cfg()
+    return msal.ConfidentialClientApplication(
+        client_id=cfg["client_id"],
+        client_credential=cfg["client_secret"],
+        authority=cfg["authority"],
+        token_cache=cache,
+    )
+
+
 def _qp_get(name: str):
     v = st.query_params.get(name)
     if v is None:
@@ -42,38 +71,8 @@ def _qp_get(name: str):
     return v
 
 
-def _get_cache() -> msal.SerializableTokenCache:
-    """
-    Keep MSAL token cache in session_state so MSAL can do silent refresh (when possible).
-    """
-    cache = msal.SerializableTokenCache()
-    if "msal_cache" in st.session_state and st.session_state["msal_cache"]:
-        try:
-            cache.deserialize(st.session_state["msal_cache"])
-        except Exception:
-            # if corrupted, ignore
-            pass
-    return cache
-
-
-def _save_cache(cache: msal.SerializableTokenCache):
-    if cache.has_state_changed:
-        st.session_state["msal_cache"] = cache.serialize()
-
-
-def _msal_app() -> msal.ConfidentialClientApplication:
-    cfg = _require_cfg()
-    cache = _get_cache()
-    return msal.ConfidentialClientApplication(
-        client_id=cfg["client_id"],
-        client_credential=cfg["client_secret"],
-        authority=cfg["authority"],
-        token_cache=cache,
-    )
-
-
 def logout():
-    for k in ["ms_token", "ms_scopes", "msal_cache"]:
+    for k in ["ms_scopes", "ms_token", "ms_account_home_id", "msal_cache"]:
         st.session_state.pop(k, None)
     try:
         st.query_params.clear()
@@ -82,49 +81,43 @@ def logout():
     st.rerun()
 
 
-def login(scopes=None):
-    """
-    Wrapper so app.py can call ms_graph.login().
-    """
-    login_ui(scopes=scopes)
-
-
 def login_ui(scopes=None):
     """
-    Renders a Sign In link button + handles Azure callback (?code=...).
-    Uses MSAL cache so subsequent refreshes can stay authenticated longer.
+    Call on the login page when NOT logged in.
+    Uses auth-code flow (no flow/state persistence needed).
     """
-    app = _msal_app()
     cfg = _require_cfg()
-
     if scopes is None:
         scopes = DEFAULT_SCOPES_READONLY
+
     st.session_state["ms_scopes"] = scopes
 
-    # Already logged in
-    if st.session_state.get("ms_token"):
-        return
+    cache = _get_cache()
+    app = _msal_app(cache)
 
+    # If callback returned with code
     code = _qp_get("code")
     if code:
+        result = None
         try:
             result = app.acquire_token_by_authorization_code(
                 code=code,
                 scopes=scopes,
                 redirect_uri=cfg["redirect_uri"],
             )
-            # Save cache updates
-            _save_cache(app.token_cache)
         except Exception as e:
             st.error(f"Login failed: {e}")
-            return
+            st.stop()
 
-        if "access_token" in result:
-            # add expires_at for our own checks
-            expires_in = int(result.get("expires_in", 3600))
-            result["expires_at"] = int(time.time()) + expires_in
+        _save_cache(cache)
 
+        if result and "access_token" in result:
             st.session_state["ms_token"] = result
+
+            # Store which account to use for silent token
+            accounts = app.get_accounts()
+            if accounts:
+                st.session_state["ms_account_home_id"] = accounts[0].get("home_account_id")
 
             try:
                 st.query_params.clear()
@@ -133,10 +126,13 @@ def login_ui(scopes=None):
 
             st.rerun()
         else:
-            st.error("Login failed. Check Azure app registration + redirect URI + scopes.")
-            st.write(result)
-        return
+            # This is where "Need admin approval" often shows up (AAD error)
+            st.error("Login did not return an access token.")
+            if result:
+                st.write(result)
+            st.stop()
 
+    # Otherwise show Sign In button
     auth_url = app.get_authorization_request_url(
         scopes=scopes,
         redirect_uri=cfg["redirect_uri"],
@@ -145,39 +141,43 @@ def login_ui(scopes=None):
     st.link_button("Sign In", auth_url)
 
 
-def get_access_token(scopes=None):
+def get_access_token():
     """
-    Returns a valid access token if possible.
-    If expired, attempt silent refresh via MSAL cache.
+    Returns a valid access token string or None.
+    Attempts silent refresh using MSAL cache.
     """
-    if scopes is None:
-        scopes = st.session_state.get("ms_scopes") or DEFAULT_SCOPES_READONLY
+    scopes = st.session_state.get("ms_scopes") or DEFAULT_SCOPES_READONLY
 
-    token = st.session_state.get("ms_token")
-    if token:
-        expires_at = token.get("expires_at")
+    cache = _get_cache()
+    app = _msal_app(cache)
+
+    # 1) If we have an existing token in session, use it if still valid
+    tok = st.session_state.get("ms_token")
+    if tok:
+        expires_at = tok.get("expires_at")
         if not expires_at:
-            expires_in = int(token.get("expires_in", 3600))
-            token["expires_at"] = int(time.time()) + expires_in
-            expires_at = token["expires_at"]
+            expires_in = int(tok.get("expires_in", 3600))
+            tok["expires_at"] = int(time.time()) + expires_in
+            expires_at = tok["expires_at"]
 
-        # if still valid (give 30s buffer)
-        if int(expires_at) - int(time.time()) > 30:
-            return token.get("access_token")
+        # if token is good for at least 2 minutes, return it
+        if int(expires_at) - int(time.time()) >= 120 and tok.get("access_token"):
+            return tok["access_token"]
 
-        # expired -> try silent refresh
-        st.session_state.pop("ms_token", None)
-
-    # Silent refresh attempt (works if MSAL cache has refresh token/account)
-    app = _msal_app()
+    # 2) Try silent token (this fixes “it won’t render after refresh / radio change”)
     accounts = app.get_accounts()
     if accounts:
+        # if we previously stored a preferred account, try it first
+        pref = st.session_state.get("ms_account_home_id")
+        if pref:
+            accounts = sorted(accounts, key=lambda a: 0 if a.get("home_account_id") == pref else 1)
+
         result = app.acquire_token_silent(scopes=scopes, account=accounts[0])
-        _save_cache(app.token_cache)
+        _save_cache(cache)
+
         if result and "access_token" in result:
-            expires_in = int(result.get("expires_in", 3600))
-            result["expires_at"] = int(time.time()) + expires_in
             st.session_state["ms_token"] = result
-            return result.get("access_token")
+            st.session_state["ms_account_home_id"] = accounts[0].get("home_account_id")
+            return result["access_token"]
 
     return None

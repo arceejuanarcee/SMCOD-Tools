@@ -1,215 +1,175 @@
 # sp_folder_graph.py
-"""
-SharePoint helper functions via Microsoft Graph for SMCOD tools.
-
-This module is designed to match the function names used by IR_gen.py:
-- resolve_site_id
-- get_default_drive_id
-- ensure_path
-- list_incident_folders
-- list_files
-- download_file_bytes
-- upload_file_to_folder
-- check_duplicate_ir
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import List, Dict, Optional
+import re
+import requests
 from urllib.parse import urlparse
 
-import requests
 
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 
 
-def _headers(access_token: str) -> dict:
-    return {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+def _headers(token: str):
+    return {"Authorization": f"Bearer {token}"}
 
 
-def _raise_for_graph(r: requests.Response):
-    try:
-        r.raise_for_status()
-    except requests.HTTPError as e:
-        # Include Graph error body for debugging
-        try:
-            detail = r.json()
-        except Exception:
-            detail = r.text
-        raise RuntimeError(f"Graph request failed: {e} | detail={detail}") from e
-
-
-def resolve_site_id(access_token: str, site_url: str) -> str:
-    """
-    Resolve a SharePoint Site ID from a standard site URL.
-    Example:
-        https://tenant.sharepoint.com/sites/SMCOD
-    """
-    u = urlparse(site_url)
-    host = u.netloc
-    path = u.path.rstrip("/")
-
-    if not host or not path:
-        raise ValueError(f"Invalid SHAREPOINT_SITE_URL: {site_url}")
-
-    url = f"{GRAPH_ROOT}/sites/{host}:{path}"
-    r = requests.get(url, headers=_headers(access_token), timeout=30)
-    _raise_for_graph(r)
-    data = r.json()
-
-    if "id" not in data:
-        raise RuntimeError(f"resolve_site_id() failed. Response: {data}")
-    return data["id"]
-
-
-def get_default_drive_id(access_token: str, site_id: str) -> str:
-    """
-    Returns the default document library (drive) ID for the site.
-    Graph endpoint: GET /sites/{site-id}/drive
-    """
-    url = f"{GRAPH_ROOT}/sites/{site_id}/drive"
-    r = requests.get(url, headers=_headers(access_token), timeout=30)
-    _raise_for_graph(r)
-    data = r.json()
-
-    if "id" not in data:
-        raise RuntimeError(f"get_default_drive_id() failed. Response: {data}")
-    return data["id"]
-
-
-def _get_child_by_name(access_token: str, drive_id: str, parent_item_id: str, name: str) -> Optional[dict]:
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{parent_item_id}/children"
-    r = requests.get(url, headers=_headers(access_token), timeout=30)
-    _raise_for_graph(r)
-    items = r.json().get("value", [])
-    for it in items:
-        if it.get("name") == name:
-            return it
-    return None
-
-
-def _create_folder(access_token: str, drive_id: str, parent_item_id: str, name: str) -> dict:
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{parent_item_id}/children"
-    payload = {
-        "name": name,
-        "folder": {},
-        "@microsoft.graph.conflictBehavior": "fail",
-    }
-    r = requests.post(url, headers={**_headers(access_token), "Content-Type": "application/json"}, json=payload, timeout=30)
-    _raise_for_graph(r)
+def _get(token: str, url: str, **kwargs):
+    r = requests.get(url, headers=_headers(token), **kwargs)
+    r.raise_for_status()
     return r.json()
 
 
-def _resolve_path_item(access_token: str, drive_id: str, path: str) -> dict:
-    """
-    Resolve an item by path. Path should be like:
-      "Ground Station Operations/Incident Reports/2026/Davao City"
-    Graph: GET /drives/{drive-id}/root:/{path}
-    """
-    path = path.strip("/")
-
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/root:/{path}"
-    r = requests.get(url, headers=_headers(access_token), timeout=30)
-    _raise_for_graph(r)
-    return r.json()
-
-
-def ensure_path(access_token: str, drive_id: str, root_path: str, parts: List[str]) -> dict:
-    """
-    Ensure folders exist for: root_path / parts[0] / parts[1] / ...
-    Returns the final folder item metadata.
-    """
-    # First resolve the root_path item
-    root_item = _resolve_path_item(access_token, drive_id, root_path)
-    parent_id = root_item["id"]
-
-    for name in parts:
-        existing = _get_child_by_name(access_token, drive_id, parent_id, name)
-        if existing is None:
-            existing = _create_folder(access_token, drive_id, parent_id, name)
-        parent_id = existing["id"]
-
-    # Return final item metadata
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{parent_id}"
-    r = requests.get(url, headers=_headers(access_token), timeout=30)
-    _raise_for_graph(r)
-    return r.json()
-
-
-def list_incident_folders(access_token: str, drive_id: str, base_path: str) -> List[dict]:
-    """
-    Lists folders under a given base_path (by path).
-    Returns list of items with 'id' and 'name'.
-    """
-    base_item = _resolve_path_item(access_token, drive_id, base_path)
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{base_item['id']}/children"
-    r = requests.get(url, headers=_headers(access_token), timeout=30)
-    _raise_for_graph(r)
-    items = r.json().get("value", [])
-    # Keep folders only
-    return [it for it in items if "folder" in it]
-
-
-def list_files(access_token: str, drive_id: str, folder_item_id: str) -> List[dict]:
-    """
-    Lists files under a folder item id.
-    """
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{folder_item_id}/children"
-    r = requests.get(url, headers=_headers(access_token), timeout=30)
-    _raise_for_graph(r)
-    items = r.json().get("value", [])
-    # Keep files only
-    return [it for it in items if "file" in it]
-
-
-def download_file_bytes(access_token: str, drive_id: str, item_id: str) -> bytes:
-    """
-    Download file content as bytes.
-    Graph: GET /drives/{drive-id}/items/{item-id}/content
-    """
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{item_id}/content"
-    r = requests.get(url, headers=_headers(access_token), timeout=60)
-    _raise_for_graph(r)
+def _get_bytes(token: str, url: str, **kwargs) -> bytes:
+    r = requests.get(url, headers=_headers(token), **kwargs)
+    r.raise_for_status()
     return r.content
 
 
-def upload_file_to_folder(
-    access_token: str,
-    drive_id: str,
-    folder_item_id: str,
-    filename: str,
-    content_bytes: bytes,
-    content_type: str = "application/octet-stream",
-) -> dict:
-    """
-    Upload a small file to a folder item id.
-    Graph: PUT /drives/{drive-id}/items/{folder-id}:/{filename}:/content
-    """
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{folder_item_id}:/{filename}:/content"
-    headers = {**_headers(access_token), "Content-Type": content_type}
-    r = requests.put(url, headers=headers, data=content_bytes, timeout=120)
-    _raise_for_graph(r)
-    return r.json()
+def _put_bytes(token: str, url: str, content: bytes, content_type: str):
+    headers = _headers(token)
+    headers["Content-Type"] = content_type
+    r = requests.put(url, headers=headers, data=content)
+    r.raise_for_status()
+    return r.json() if r.content else {}
 
 
-def check_duplicate_ir(
-    access_token: str,
-    drive_id: str,
-    incident_reports_root_path: str,
-    year: str,
-    city: str,
-    full_incident_no: str,
-) -> bool:
+def resolve_site_id(token: str, sharepoint_site_url: str) -> str:
     """
-    Checks if the incident folder already exists under:
-      root/year/city/full_incident_no
-    Returns True if exists, False otherwise.
+    sharepoint_site_url example:
+    https://philsaorg.sharepoint.com/sites/YourSiteName
     """
-    path = f"{incident_reports_root_path}/{year}/{city}/{full_incident_no}".strip("/")
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/root:/{path}"
-    r = requests.get(url, headers=_headers(access_token), timeout=30)
-    if r.status_code == 404:
-        return False
-    _raise_for_graph(r)
-    return True
+    u = urlparse(sharepoint_site_url)
+    host = u.netloc
+    path = u.path.strip("/")
+
+    if not host or not path:
+        raise ValueError("Invalid sharepoint_site_url. Example: https://TENANT.sharepoint.com/sites/SITE")
+
+    # Graph sites lookup:
+    # GET /sites/{hostname}:/sites/{site-path}
+    # If your URL already includes /sites/XYZ, keep it as-is in the path.
+    url = f"{GRAPH_ROOT}/sites/{host}:/{path}"
+    j = _get(token, url)
+    site_id = j.get("id")
+    if not site_id:
+        raise RuntimeError("Could not resolve SharePoint site id")
+    return site_id
+
+
+def get_default_drive_id(token: str, site_id: str) -> str:
+    # GET /sites/{site-id}/drive
+    j = _get(token, f"{GRAPH_ROOT}/sites/{site_id}/drive")
+    drive_id = j.get("id")
+    if not drive_id:
+        raise RuntimeError("Could not resolve default drive id")
+    return drive_id
+
+
+def list_children_by_path(token: str, drive_id: str, folder_path: str):
+    # /drives/{drive-id}/root:/{path}:/children
+    folder_path = folder_path.strip("/")
+    url = f"{GRAPH_ROOT}/drives/{drive_id}/root:/{folder_path}:/children"
+    j = _get(token, url)
+    return j.get("value", [])
+
+
+def list_incident_folders(token: str, drive_id: str, base_path: str):
+    kids = list_children_by_path(token, drive_id, base_path)
+    folders = [x for x in kids if x.get("folder") is not None]
+    # Sort by name
+    folders.sort(key=lambda x: x.get("name", "").lower())
+    return [{"id": f["id"], "name": f["name"]} for f in folders]
+
+
+def list_files(token: str, drive_id: str, folder_item_id: str):
+    # /drives/{drive-id}/items/{item-id}/children
+    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{folder_item_id}/children"
+    j = _get(token, url)
+    files = [x for x in j.get("value", []) if x.get("file") is not None]
+    files.sort(key=lambda x: x.get("name", "").lower())
+    return [{"id": f["id"], "name": f["name"]} for f in files]
+
+
+def download_file_bytes(token: str, drive_id: str, item_id: str) -> bytes:
+    # /drives/{drive-id}/items/{item-id}/content
+    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{item_id}/content"
+    return _get_bytes(token, url)
+
+
+def upload_file_to_folder(token: str, drive_id: str, folder_item_id: str, filename: str, content_bytes: bytes, content_type: str):
+    # PUT /drives/{drive-id}/items/{parent-id}:/{filename}:/content
+    safe_name = filename.replace("\\", "/").split("/")[-1]
+    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{folder_item_id}:/{safe_name}:/content"
+    return _put_bytes(token, url, content_bytes, content_type)
+
+
+def _ensure_folder(token: str, drive_id: str, parent_item_id: str, folder_name: str):
+    # Create folder under parent
+    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{parent_item_id}/children"
+    payload = {
+        "name": folder_name,
+        "folder": {},
+        "@microsoft.graph.conflictBehavior": "fail",
+    }
+    r = requests.post(url, headers={**_headers(token), "Content-Type": "application/json"}, json=payload)
+    if r.status_code in (200, 201):
+        return r.json()
+    # if already exists, we’ll fall back to listing
+    if r.status_code == 409:
+        return None
+    r.raise_for_status()
+
+
+def _find_child_folder(token: str, drive_id: str, parent_item_id: str, folder_name: str):
+    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{parent_item_id}/children"
+    j = _get(token, url)
+    for item in j.get("value", []):
+        if item.get("name") == folder_name and item.get("folder") is not None:
+            return item
+    return None
+
+
+def ensure_path(token: str, drive_id: str, root_path: str, parts: list[str]):
+    """
+    Ensure folder path exists under drive root:
+    root_path / parts[0] / parts[1] / ...
+    Returns final folder item.
+    """
+    # Start at root_path
+    root_path = root_path.strip("/")
+    # Get the item id for root_path
+    root_item = _get(token, f"{GRAPH_ROOT}/drives/{drive_id}/root:/{root_path}")
+    parent_id = root_item["id"]
+
+    for p in parts:
+        p = (p or "").strip()
+        if not p:
+            continue
+
+        existing = _find_child_folder(token, drive_id, parent_id, p)
+        if existing:
+            parent_id = existing["id"]
+            continue
+
+        created = _ensure_folder(token, drive_id, parent_id, p)
+        if created is None:
+            # race or already exists
+            existing = _find_child_folder(token, drive_id, parent_id, p)
+            if not existing:
+                raise RuntimeError(f"Unable to create/find folder: {p}")
+            parent_id = existing["id"]
+        else:
+            parent_id = created["id"]
+
+    return _get(token, f"{GRAPH_ROOT}/drives/{drive_id}/items/{parent_id}")
+
+
+def check_duplicate_ir(token: str, drive_id: str, root_path: str, year: str, city: str, incident_folder_name: str) -> bool:
+    """
+    Returns True if folder already exists under:
+    root_path/year/city/incident_folder_name
+    """
+    path = f"{root_path}/{year}/{city}".strip("/")
+    kids = list_children_by_path(token, drive_id, path)
+    for x in kids:
+        if x.get("folder") is not None and x.get("name") == incident_folder_name:
+            return True
+    return False
