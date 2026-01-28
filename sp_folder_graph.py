@@ -1,175 +1,162 @@
-# sp_folder_graph.py
-import re
 import requests
-from urllib.parse import urlparse
+
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 
-GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
+def _headers(token: str, extra: dict | None = None):
+    h = {"Authorization": f"Bearer {token}"}
+    if extra:
+        h.update(extra)
+    return h
 
 
-def _headers(token: str):
-    return {"Authorization": f"Bearer {token}"}
+def resolve_site_id(token: str, site_url: str) -> str:
+    site_url = site_url.rstrip("/")
+    if "://" in site_url:
+        site_url = site_url.split("://", 1)[1]
+    host, path = site_url.split("/", 1)
+    path = "/" + path
+
+    url = f"{GRAPH_BASE}/sites/{host}:{path}"
+    r = requests.get(url, headers=_headers(token), timeout=60)
+    r.raise_for_status()
+    return r.json()["id"]
 
 
-def _get(token: str, url: str, **kwargs):
-    r = requests.get(url, headers=_headers(token), **kwargs)
+def get_default_drive_id(token: str, site_id: str) -> str:
+    url = f"{GRAPH_BASE}/sites/{site_id}/drive"
+    r = requests.get(url, headers=_headers(token), timeout=60)
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def _item_by_path(token: str, drive_id: str, path: str):
+    path = path.strip("/")
+    url = f"{GRAPH_BASE}/drives/{drive_id}/root:/{path}"
+    r = requests.get(url, headers=_headers(token), timeout=60)
+    if r.status_code == 404:
+        return None
     r.raise_for_status()
     return r.json()
 
 
-def _get_bytes(token: str, url: str, **kwargs) -> bytes:
-    r = requests.get(url, headers=_headers(token), **kwargs)
+def _children(token: str, drive_id: str, folder_item_id: str):
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{folder_item_id}/children"
+    r = requests.get(url, headers=_headers(token), timeout=60)
+    r.raise_for_status()
+    return r.json().get("value", [])
+
+
+def ensure_folder(token: str, drive_id: str, parent_item_id: str, folder_name: str) -> dict:
+    kids = _children(token, drive_id, parent_item_id)
+    for k in kids:
+        if k.get("name") == folder_name and k.get("folder") is not None:
+            return k
+
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{parent_item_id}/children"
+    payload = {"name": folder_name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}
+    r = requests.post(url, headers=_headers(token, {"Content-Type": "application/json"}), json=payload, timeout=60)
+
+    if r.status_code == 409:
+        kids = _children(token, drive_id, parent_item_id)
+        for k in kids:
+            if k.get("name") == folder_name and k.get("folder") is not None:
+                return k
+
+    r.raise_for_status()
+    return r.json()
+
+
+def ensure_path(token: str, drive_id: str, root_path: str, parts: list[str]) -> dict:
+    root_item = _item_by_path(token, drive_id, root_path)
+    if not root_item:
+        raise RuntimeError(f"Root path not found in drive: {root_path}")
+
+    current = root_item
+    for name in parts:
+        current = ensure_folder(token, drive_id, current["id"], name)
+    return current
+
+
+def upload_file_to_folder(token: str, drive_id: str, folder_item_id: str, filename: str, content_bytes: bytes, content_type: str):
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{folder_item_id}:/{filename}:/content"
+    r = requests.put(url, headers=_headers(token, {"Content-Type": content_type}), data=content_bytes, timeout=120)
+    r.raise_for_status()
+    return r.json()
+
+
+def check_duplicate_ir(token: str, drive_id: str, root_path: str, year: str, city: str, incident_folder_name: str) -> bool:
+    path = f"{root_path}/{year}/{city}/{incident_folder_name}"
+    item = _item_by_path(token, drive_id, path)
+    return bool(item and item.get("folder") is not None)
+
+
+# ---------------------------
+# NEW: list incident folders
+# ---------------------------
+def list_incident_folders(token: str, drive_id: str, base_path: str) -> list[dict]:
+    """
+    base_path is .../<Year>/<City>
+    returns [{"id":..., "name":...}, ...] for folders only
+    """
+    folder = _item_by_path(token, drive_id, base_path)
+    if not folder or folder.get("folder") is None:
+        raise RuntimeError(f"Folder not found: {base_path}")
+
+    kids = _children(token, drive_id, folder["id"])
+    out = []
+    for k in kids:
+        if k.get("folder") is not None:
+            out.append({"id": k["id"], "name": k["name"]})
+    # sort newest-style names last; simple alpha sort is fine
+    return sorted(out, key=lambda x: x["name"].lower())
+
+
+# ---------------------------
+# NEW: list files inside incident folder
+# ---------------------------
+def list_files(token: str, drive_id: str, folder_item_id: str) -> list[dict]:
+    kids = _children(token, drive_id, folder_item_id)
+    out = []
+    for k in kids:
+        if k.get("file") is not None:
+            out.append({
+                "id": k["id"],
+                "name": k["name"],
+                "size": k.get("size", 0),
+                "mime": k.get("file", {}).get("mimeType", ""),
+            })
+    return sorted(out, key=lambda x: x["name"].lower())
+
+
+def download_file_bytes(token: str, drive_id: str, file_item_id: str) -> bytes:
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{file_item_id}/content"
+    r = requests.get(url, headers=_headers(token), timeout=120)
     r.raise_for_status()
     return r.content
 
 
-def _put_bytes(token: str, url: str, content: bytes, content_type: str):
-    headers = _headers(token)
-    headers["Content-Type"] = content_type
-    r = requests.put(url, headers=headers, data=content)
+def download_file_text(token: str, drive_id: str, file_item_id: str) -> str:
+    b = download_file_bytes(token, drive_id, file_item_id)
+    return b.decode("utf-8", errors="replace")
+
+
+def update_file_text(token: str, drive_id: str, file_item_id: str, new_text: str):
+    meta_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{file_item_id}"
+    meta = requests.get(meta_url, headers=_headers(token), timeout=60)
+    meta.raise_for_status()
+    meta = meta.json()
+
+    parent_id = meta["parentReference"]["id"]
+    filename = meta["name"]
+
+    content_bytes = (new_text or "").encode("utf-8")
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{parent_id}:/{filename}:/content"
+    r = requests.put(
+        url,
+        headers=_headers(token, {"Content-Type": "text/plain; charset=utf-8"}),
+        data=content_bytes,
+        timeout=120,
+    )
     r.raise_for_status()
-    return r.json() if r.content else {}
-
-
-def resolve_site_id(token: str, sharepoint_site_url: str) -> str:
-    """
-    sharepoint_site_url example:
-    https://philsaorg.sharepoint.com/sites/YourSiteName
-    """
-    u = urlparse(sharepoint_site_url)
-    host = u.netloc
-    path = u.path.strip("/")
-
-    if not host or not path:
-        raise ValueError("Invalid sharepoint_site_url. Example: https://TENANT.sharepoint.com/sites/SITE")
-
-    # Graph sites lookup:
-    # GET /sites/{hostname}:/sites/{site-path}
-    # If your URL already includes /sites/XYZ, keep it as-is in the path.
-    url = f"{GRAPH_ROOT}/sites/{host}:/{path}"
-    j = _get(token, url)
-    site_id = j.get("id")
-    if not site_id:
-        raise RuntimeError("Could not resolve SharePoint site id")
-    return site_id
-
-
-def get_default_drive_id(token: str, site_id: str) -> str:
-    # GET /sites/{site-id}/drive
-    j = _get(token, f"{GRAPH_ROOT}/sites/{site_id}/drive")
-    drive_id = j.get("id")
-    if not drive_id:
-        raise RuntimeError("Could not resolve default drive id")
-    return drive_id
-
-
-def list_children_by_path(token: str, drive_id: str, folder_path: str):
-    # /drives/{drive-id}/root:/{path}:/children
-    folder_path = folder_path.strip("/")
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/root:/{folder_path}:/children"
-    j = _get(token, url)
-    return j.get("value", [])
-
-
-def list_incident_folders(token: str, drive_id: str, base_path: str):
-    kids = list_children_by_path(token, drive_id, base_path)
-    folders = [x for x in kids if x.get("folder") is not None]
-    # Sort by name
-    folders.sort(key=lambda x: x.get("name", "").lower())
-    return [{"id": f["id"], "name": f["name"]} for f in folders]
-
-
-def list_files(token: str, drive_id: str, folder_item_id: str):
-    # /drives/{drive-id}/items/{item-id}/children
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{folder_item_id}/children"
-    j = _get(token, url)
-    files = [x for x in j.get("value", []) if x.get("file") is not None]
-    files.sort(key=lambda x: x.get("name", "").lower())
-    return [{"id": f["id"], "name": f["name"]} for f in files]
-
-
-def download_file_bytes(token: str, drive_id: str, item_id: str) -> bytes:
-    # /drives/{drive-id}/items/{item-id}/content
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{item_id}/content"
-    return _get_bytes(token, url)
-
-
-def upload_file_to_folder(token: str, drive_id: str, folder_item_id: str, filename: str, content_bytes: bytes, content_type: str):
-    # PUT /drives/{drive-id}/items/{parent-id}:/{filename}:/content
-    safe_name = filename.replace("\\", "/").split("/")[-1]
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{folder_item_id}:/{safe_name}:/content"
-    return _put_bytes(token, url, content_bytes, content_type)
-
-
-def _ensure_folder(token: str, drive_id: str, parent_item_id: str, folder_name: str):
-    # Create folder under parent
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{parent_item_id}/children"
-    payload = {
-        "name": folder_name,
-        "folder": {},
-        "@microsoft.graph.conflictBehavior": "fail",
-    }
-    r = requests.post(url, headers={**_headers(token), "Content-Type": "application/json"}, json=payload)
-    if r.status_code in (200, 201):
-        return r.json()
-    # if already exists, we’ll fall back to listing
-    if r.status_code == 409:
-        return None
-    r.raise_for_status()
-
-
-def _find_child_folder(token: str, drive_id: str, parent_item_id: str, folder_name: str):
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{parent_item_id}/children"
-    j = _get(token, url)
-    for item in j.get("value", []):
-        if item.get("name") == folder_name and item.get("folder") is not None:
-            return item
-    return None
-
-
-def ensure_path(token: str, drive_id: str, root_path: str, parts: list[str]):
-    """
-    Ensure folder path exists under drive root:
-    root_path / parts[0] / parts[1] / ...
-    Returns final folder item.
-    """
-    # Start at root_path
-    root_path = root_path.strip("/")
-    # Get the item id for root_path
-    root_item = _get(token, f"{GRAPH_ROOT}/drives/{drive_id}/root:/{root_path}")
-    parent_id = root_item["id"]
-
-    for p in parts:
-        p = (p or "").strip()
-        if not p:
-            continue
-
-        existing = _find_child_folder(token, drive_id, parent_id, p)
-        if existing:
-            parent_id = existing["id"]
-            continue
-
-        created = _ensure_folder(token, drive_id, parent_id, p)
-        if created is None:
-            # race or already exists
-            existing = _find_child_folder(token, drive_id, parent_id, p)
-            if not existing:
-                raise RuntimeError(f"Unable to create/find folder: {p}")
-            parent_id = existing["id"]
-        else:
-            parent_id = created["id"]
-
-    return _get(token, f"{GRAPH_ROOT}/drives/{drive_id}/items/{parent_id}")
-
-
-def check_duplicate_ir(token: str, drive_id: str, root_path: str, year: str, city: str, incident_folder_name: str) -> bool:
-    """
-    Returns True if folder already exists under:
-    root_path/year/city/incident_folder_name
-    """
-    path = f"{root_path}/{year}/{city}".strip("/")
-    kids = list_children_by_path(token, drive_id, path)
-    for x in kids:
-        if x.get("folder") is not None and x.get("name") == incident_folder_name:
-            return True
-    return False
+    return r.json()
