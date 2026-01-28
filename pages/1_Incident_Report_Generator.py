@@ -5,17 +5,27 @@ from pathlib import Path
 import streamlit as st
 import ms_graph
 
-# --- Auth guard: NEVER login here; always return to app.py ---
+# --- Auth guard ---
 token = ms_graph.get_access_token()
 if not token:
     st.switch_page("app.py")
     st.stop()
 
-# --- Ensure repo root is importable (important in Streamlit Cloud) ---
+# --- Top bar: Back to Home ---
+top_l, top_r = st.columns([0.85, 0.15])
+with top_l:
+    if st.button("⬅ Back to Home"):
+        st.switch_page("app.py")
+with top_r:
+    if st.button("Logout"):
+        ms_graph.logout()
+
+st.divider()
+
+# --- Ensure repo root import path ---
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# --- Import the tool normally (do NOT runpy) ---
-# IR_gen currently executes on import; that's fine.
+# --- Import the tool (executes on import) ---
 import IR_gen  # noqa: F401
