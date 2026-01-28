@@ -1,11 +1,36 @@
+from __future__ import annotations
+
 import runpy
 from pathlib import Path
 import streamlit as st
 import ms_graph
 
-APP_TITLE = "SMCOD Tools Portal"
-ROOT = Path(__file__).resolve().parents[1]
+APP_TITLE = "Incident Report Generator"
 LOGO_BASENAME = "PhilSA_v4-01"
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+st.set_page_config(
+    page_title=APP_TITLE,
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# Hide Streamlit header so it never overlaps your logo
+st.markdown(
+    """
+    <style>
+      header[data-testid="stHeader"] { display: none; }
+      div[data-testid="stToolbar"] { display: none; }
+      #MainMenu { visibility: hidden; }
+      footer { visibility: hidden; }
+
+      .block-container { padding-top: 1.3rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 def _find_logo_path() -> Path | None:
@@ -20,36 +45,24 @@ def _find_logo_path() -> Path | None:
     return None
 
 
-def render_header(title: str):
+def render_logo_header():
+    """Universal logo header. Everything else goes below."""
     logo_path = _find_logo_path()
-
-    st.markdown(
-        """
-        <style>
-          .block-container { padding-top: 1.0rem; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    c1, c2 = st.columns([0.20, 0.80], gap="small")
-    with c1:
-        if logo_path:
-            st.image(str(logo_path), width=120)
-    with c2:
-        st.markdown(f"## {title}")
+    if logo_path:
+        st.image(str(logo_path), width=120)
+    st.divider()
 
 
 def main():
-    st.set_page_config(page_title="Incident Report Generator", page_icon="📝", layout="wide")
-
-    # Require login (shared session across pages)
+    # Must be logged in; otherwise go back to login/home
     if not ms_graph.get_access_token():
         st.switch_page("app.py")
 
-    render_header("Incident Report Generator")
+    render_logo_header()
 
-    # Navigation row (below header)
-    nav = st.columns([0.20, 0.15, 0.65])
+    st.markdown(f"## {APP_TITLE}")
+
+    nav = st.columns([0.22, 0.14, 0.64])
     with nav[0]:
         if st.button("← Back to Home", use_container_width=True):
             st.switch_page("app.py")
@@ -59,10 +72,7 @@ def main():
 
     st.divider()
 
-    # IMPORTANT:
-    # - DO NOT `import IR_gen` here, because imports are cached and the app can appear blank
-    #   after reruns (e.g., refresh, radio changes).
-    # - runpy re-executes IR_gen.py on each rerun.
+    # IMPORTANT: do NOT `import IR_gen` (it gets cached and becomes blank on reruns)
     runpy.run_path(str(ROOT / "IR_gen.py"), run_name="__main__")
 
 
