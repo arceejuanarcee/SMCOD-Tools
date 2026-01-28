@@ -1,14 +1,21 @@
 # pages/1_Incident_Report_Generator.py
-import streamlit as st
-import ms_graph
-import runpy
+import sys
 from pathlib import Path
 
-# Never do login here.
-# If not logged in, always go back to portal.
-if not ms_graph.get_access_token():
+import streamlit as st
+import ms_graph
+
+# --- Auth guard: NEVER login here; always return to app.py ---
+token = ms_graph.get_access_token()
+if not token:
     st.switch_page("app.py")
     st.stop()
 
+# --- Ensure repo root is importable (important in Streamlit Cloud) ---
 ROOT = Path(__file__).resolve().parents[1]
-runpy.run_path(str(ROOT / "IR_gen.py"), run_name="__main__")
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# --- Import the tool normally (do NOT runpy) ---
+# IR_gen currently executes on import; that's fine.
+import IR_gen  # noqa: F401
