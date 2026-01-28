@@ -7,16 +7,7 @@ import streamlit as st
 import ms_graph
 from ui_header import render_logo_header
 
-# IMPORTANT: do NOT call st.set_page_config here (app.py already did)
-
-token = ms_graph.get_access_token()
-if not token:
-    st.switch_page("app.py")
-    st.stop()
-
 render_logo_header()
-
-# Everything BELOW logo
 st.markdown("# Incident Report Generator")
 
 b1, b2, _ = st.columns([1.2, 1.0, 6])
@@ -29,21 +20,28 @@ with b2:
 
 st.write("")
 
+# If token missing (refresh / rerun), show login HERE instead of going blank
+token = ms_graph.get_access_token()
+if not token:
+    st.warning("Session expired. Please sign in again.")
+    ms_graph.login_ui()
+    st.stop()
+
 # Ensure repo root import path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Prevent IR_gen from crashing due to set_page_config being called after UI
+# Prevent IR_gen from crashing due to st.set_page_config being called after UI
 _original_set_page_config = st.set_page_config
 try:
     st.set_page_config = lambda *args, **kwargs: None  # no-op during import
 
-    # Import tool. If it fails, show FULL error here.
     try:
         import IR_gen  # noqa: F401
     except Exception:
-        st.error("IR_gen failed to load. Here is the full traceback (for debugging):")
+        st.error("IR_gen failed to load. Full traceback:")
         st.code(traceback.format_exc())
+
 finally:
     st.set_page_config = _original_set_page_config

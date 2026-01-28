@@ -15,11 +15,8 @@ if not token:
     st.caption("Sign in to access internal tools.")
     st.write("")
 
-    c = st.columns([1, 4, 6])[0]  # left aligned column
-    with c:
-        if st.button("Sign In", use_container_width=False):
-            ms_graph.login()
-
+    # IMPORTANT: ms_graph has NO login(); use login_ui()
+    ms_graph.login_ui()
     st.stop()
 
 # --- Dashboard (ALL BELOW LOGO) ---
@@ -32,7 +29,6 @@ with top_r:
 
 st.write("")
 
-# 2 rows x 3 columns tiles
 rows = [
     [
         ("Incident Report Generator", "pages/1_Incident_Report_Generator.py", True),
